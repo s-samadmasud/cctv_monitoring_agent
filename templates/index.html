@@ -5,17 +5,89 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>CCTV Monitoring</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const form = document.getElementById('uploadForm');
+            const statusDiv = document.getElementById('statusMessage');
+            const downloadLinkDiv = document.getElementById('downloadLink');
+            const audioAlert = new Audio("{{ url_for('static', filename='warning-alarm.mp3') }}");
+            
+            const handleDownload = (filename) => {
+                downloadLinkDiv.innerHTML = `
+                    <p class="success">Processing complete! Your video is ready to download.</p>
+                    <a href="/download/${filename}" class="button" download>Download Processed Video</a>
+                `;
+            };
+
+            const checkStatus = (taskId) => {
+                const intervalId = setInterval(async () => {
+                    const response = await fetch(`/status/${taskId}`);
+                    const data = await response.json();
+                    
+                    statusDiv.innerHTML = `<p class="info">Task ID: ${taskId}</p>`;
+
+                    if (data.status === 'completed') {
+                        clearInterval(intervalId);
+                        statusDiv.innerHTML = `<p class="success">Video processing complete! Preparing download link...</p>`;
+                        handleDownload(data.filename);
+                        
+                        if (data.prediction === 'Abnormal_Activities') {
+                            console.log('Abnormal activity detected. Triggering alert.');
+                            audioAlert.play();
+                            alert("Abnormal activity detected!");
+                        }
+                    } else if (data.status === 'error') {
+                        clearInterval(intervalId);
+                        statusDiv.innerHTML = `<p class="error">An error occurred: ${data.message}</p>`;
+                    } else {
+                        statusDiv.innerHTML = `<p class="info">Status: ${data.status.toUpperCase()} - Progress: ${data.progress}%</p>`;
+                    }
+                }, 3000); // Poll every 3 seconds
+            };
+
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                statusDiv.innerHTML = `<p class="info">Uploading video... Please wait.</p>`;
+                
+                const formData = new FormData(form);
+
+                try {
+                    const response = await fetch('/upload', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    const data = await response.json();
+                    
+                    if (data.status === 'success') {
+                        form.style.display = 'none';
+                        statusDiv.innerHTML = `<p class="success">${data.message}</p>`;
+                        checkStatus(data.task_id);
+                    } else {
+                        statusDiv.innerHTML = `<p class="error">Upload failed: ${data.error}</p>`;
+                    }
+                } catch (error) {
+                    statusDiv.innerHTML = `<p class="error">An unexpected error occurred during upload. Please try again.</p>`;
+                }
+            });
+        });
+    </script>
 </head>
 <body>
-
     <div class="container">
         <h1>CCTV Monitoring</h1>
-        <p>Upload a video to analyze for abnormal activities. The application will return a new video with the predictions overlaid.</p>
-        <form method="post" action="/upload" enctype="multipart/form-data">
+        <p>Upload a video to analyze for abnormal activities.
+            <br>
+            <small>A sound alarm will trigger if abnormal activity is detected.</small>
+        </p>
+        
+        <form id="uploadForm">
             <input type="file" name="file" id="fileInput" accept="video/mp4,video/avi,video/mov" required>
-            <input type="submit" value="Upload & Analyze">
+            <button type="submit" class="button">Upload & Analyze</button>
         </form>
-    </div>
 
+        <div id="statusMessage"></div>
+        <div id="downloadLink"></div>
+    </div>
 </body>
 </html>

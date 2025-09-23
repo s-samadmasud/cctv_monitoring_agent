@@ -7,8 +7,6 @@ from tensorflow.keras.layers import TimeDistributed, LSTM, GlobalAveragePooling2
 from tensorflow.keras.applications import MobileNetV2
 import multiprocessing
 import uuid
-import time
-import json
 
 # ------------------ Constants ------------------
 IMG_SIZE = 128
@@ -24,9 +22,11 @@ MODEL_PATH = os.path.join(os.getcwd(), 'models', 'cctv_monitoring.keras')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# Shared memory for task status
-manager = multiprocessing.Manager()
-task_status = manager.dict()
+# ------------------ Global variables for multiprocessing ------------------
+model = None
+manager = None
+task_status = None
+pool = None
 
 # ------------------ Build Model Architecture ------------------
 def build_model():
@@ -53,8 +53,6 @@ def build_model():
     model = Model(inputs=input_sequence, outputs=output)
     return model
 
-# ------------------ Load Model (Global scope for multiprocessing) ------------------
-model = None
 def init_worker():
     """Load model in worker process once to avoid reloading for every task."""
     global model
@@ -68,11 +66,10 @@ def init_worker():
         print(f"Error loading model weights: {e}")
         model = None
 
-# Video processing function (to be run in a separate process)
 def process_video_task(task_id, input_video_path, output_video_path):
     """Processes the video and overlays the predictions. Runs in a separate process."""
     task_status[task_id] = {'status': 'processing', 'progress': 0}
-    
+
     if model is None:
         task_status[task_id] = {'status': 'error', 'message': 'Model not loaded.'}
         return
@@ -92,16 +89,16 @@ def process_video_task(task_id, input_video_path, output_video_path):
 
     original_frame_buffer = []
     processed_frame_buffer = []
+    predicted_class_name = "Normal_Activities" # Default prediction
 
     frame_count = 0
     while True:
         ret, original_frame = cap.read()
         if not ret:
             break
-        
+
         frame_count += 1
-        
-        # Update progress for the user
+
         if frame_count % 100 == 0:
              task_status[task_id]['progress'] = int((frame_count / total_frames) * 100)
 
@@ -144,17 +141,13 @@ def process_video_task(task_id, input_video_path, output_video_path):
 
     cap.release()
     out.release()
-    
-    # Clean up the original file after processing
     os.remove(input_video_path)
-    
-    task_status[task_id] = {'status': 'completed', 'progress': 100, 'filename': os.path.basename(output_video_path)}
 
+    result = {'status': 'completed', 'progress': 100, 'filename': os.path.basename(output_video_path)}
+    if 'predicted_class_name' in locals():
+        result['prediction'] = predicted_class_name
 
-# Multiprocessing pool for background tasks
-# The 'initializer' is important to load the model just once per process
-num_cpus = multiprocessing.cpu_count()
-pool = multiprocessing.Pool(processes=num_cpus, initializer=init_worker)
+    task_status[task_id] = result
 
 # ------------------ Flask App ------------------
 app = Flask(__name__)
@@ -175,14 +168,13 @@ def upload_video():
     filename = file.filename
     input_path = os.path.join(UPLOAD_FOLDER, file_id + '_' + filename)
     output_path = os.path.join(OUTPUT_FOLDER, file_id + '_' + 'processed_' + filename)
-    
+
     file.save(input_path)
-    
+
     task_status[file_id] = {'status': 'queued'}
-    
-    # Dispatch the video processing to the background pool
+
     pool.apply_async(process_video_task, args=(file_id, input_path, output_path))
-    
+
     return jsonify({
         "status": "success",
         "message": "Video uploaded and is now processing in the background.",
@@ -204,4 +196,8 @@ def download_file(filename):
     return jsonify({"error": "File not found"}), 404
 
 if __name__ == "__main__":
+    manager = multiprocessing.Manager()
+    task_status = manager.dict()
+    num_cpus = multiprocessing.cpu_count()
+    pool = multiprocessing.Pool(processes=num_cpus, initializer=init_worker)
     app.run(host="0.0.0.0", port=5000, debug=True)
