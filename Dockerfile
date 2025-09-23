@@ -36,5 +36,5 @@ COPY . .
 # Expose the port the app will run on
 EXPOSE 5000
 
-# Run the application using Gunicorn
-ENTRYPOINT ["gunicorn", "--bind", "0.0.0.0:5000", "app:app"]
+# Run the application using Gunicorn with a longer timeout
+ENTRYPOINT ["gunicorn", "--bind", "0.0.0.0:5000", "--timeout", "300", "app:app"]
