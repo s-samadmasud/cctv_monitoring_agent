@@ -24,9 +24,10 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # ------------------ Global variables for multiprocessing ------------------
 model = None
-manager = None
-task_status = None
-pool = None
+manager = multiprocessing.Manager()
+task_status = manager.dict()
+num_cpus = multiprocessing.cpu_count()
+pool = multiprocessing.Pool(processes=num_cpus, initializer=lambda: init_worker(MODEL_PATH))
 
 # ------------------ Build Model Architecture ------------------
 def build_model():
@@ -53,14 +54,14 @@ def build_model():
     model = Model(inputs=input_sequence, outputs=output)
     return model
 
-def init_worker():
+def init_worker(model_path):
     """Load model in worker process once to avoid reloading for every task."""
     global model
     model = build_model()
     try:
-        model.load_weights(MODEL_PATH)
+        model.load_weights(model_path)
     except FileNotFoundError:
-        print(f"Warning: Model weights file '{MODEL_PATH}' not found. Worker will not make predictions.")
+        print(f"Warning: Model weights file '{model_path}' not found. Worker will not make predictions.")
         model = None
     except Exception as e:
         print(f"Error loading model weights: {e}")
@@ -196,8 +197,4 @@ def download_file(filename):
     return jsonify({"error": "File not found"}), 404
 
 if __name__ == "__main__":
-    manager = multiprocessing.Manager()
-    task_status = manager.dict()
-    num_cpus = multiprocessing.cpu_count()
-    pool = multiprocessing.Pool(processes=num_cpus, initializer=init_worker)
     app.run(host="0.0.0.0", port=5000, debug=True)
