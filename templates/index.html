@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CCTV Monitoring</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+    <div class="container">
+        <h1>CCTV Monitoring</h1>
+        <p>Upload a video to analyze for abnormal activities. The application will return a new video with the predictions overlaid.</p>
+        <form method="post" action="/upload" enctype="multipart/form-data">
+            <input type="file" name="file" id="fileInput" accept="video/mp4,video/avi,video/mov" required>
+            <input type="submit" value="Upload & Analyze">
+        </form>
+    </div>
+
+</body>
+</html>
