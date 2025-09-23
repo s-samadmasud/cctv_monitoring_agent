@@ -1,16 +1,32 @@
 import os
 import cv2
 import numpy as np
-from flask import Flask, request, send_file, render_template
+from flask import Flask, request, send_file, render_template, jsonify
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import TimeDistributed, LSTM, GlobalAveragePooling2D, Dropout, BatchNormalization, Dense, Input
 from tensorflow.keras.applications import MobileNetV2
+import multiprocessing
+import uuid
+import time
+import json
 
 # ------------------ Constants ------------------
 IMG_SIZE = 128
 FRAME_COUNT = 15
 CLASSES = ['Normal_Activities', 'Abnormal_Activities']
-# ALARM_SOUND_PATH is not needed for cloud deployment
+
+# Paths
+UPLOAD_FOLDER = os.path.join(os.getcwd(), 'uploads')
+OUTPUT_FOLDER = os.path.join(os.getcwd(), 'outputs')
+MODEL_PATH = os.path.join(os.getcwd(), 'models', 'cctv_monitoring.keras')
+
+# Create directories if they don't exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# Shared memory for task status
+manager = multiprocessing.Manager()
+task_status = manager.dict()
 
 # ------------------ Build Model Architecture ------------------
 def build_model():
@@ -37,39 +53,39 @@ def build_model():
     model = Model(inputs=input_sequence, outputs=output)
     return model
 
-# ------------------ Load Model and Handle Errors ------------------
-model = build_model()
-try:
-    model.load_weights("models/cctv_monitoring.keras")
-except FileNotFoundError:
-    print("Warning: Model weights file 'cctv_monitoring.keras' not found.")
-    print("The model will not be able to make predictions.")
-    model = None
+# ------------------ Load Model (Global scope for multiprocessing) ------------------
+model = None
+def init_worker():
+    """Load model in worker process once to avoid reloading for every task."""
+    global model
+    model = build_model()
+    try:
+        model.load_weights(MODEL_PATH)
+    except FileNotFoundError:
+        print(f"Warning: Model weights file '{MODEL_PATH}' not found. Worker will not make predictions.")
+        model = None
+    except Exception as e:
+        print(f"Error loading model weights: {e}")
+        model = None
 
-# ------------------ Flask App ------------------
-app = Flask(__name__)
-
-# Route for the home page (GET request)
-@app.route("/")
-def home():
-    """Serves the video upload form."""
-    return render_template("index.html")
-
-# The playsound functionality is removed as it's not suitable for cloud deployment
-# A cloud server doesn't have an audio device to play sound.
-# The front-end is responsible for playing the alarm.
-def process_video(input_video_path, output_video_path):
-    """Processes the video and overlays the predictions."""
+# Video processing function (to be run in a separate process)
+def process_video_task(task_id, input_video_path, output_video_path):
+    """Processes the video and overlays the predictions. Runs in a separate process."""
+    task_status[task_id] = {'status': 'processing', 'progress': 0}
+    
     if model is None:
-        raise Exception("Model is not loaded. Cannot process video.")
+        task_status[task_id] = {'status': 'error', 'message': 'Model not loaded.'}
+        return
 
     cap = cv2.VideoCapture(input_video_path)
     if not cap.isOpened():
-        raise Exception("Could not open input video")
+        task_status[task_id] = {'status': 'error', 'message': 'Could not open input video.'}
+        return
 
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
@@ -77,10 +93,17 @@ def process_video(input_video_path, output_video_path):
     original_frame_buffer = []
     processed_frame_buffer = []
 
+    frame_count = 0
     while True:
         ret, original_frame = cap.read()
         if not ret:
             break
+        
+        frame_count += 1
+        
+        # Update progress for the user
+        if frame_count % 100 == 0:
+             task_status[task_id]['progress'] = int((frame_count / total_frames) * 100)
 
         original_frame_buffer.append(original_frame)
         processed_frame = cv2.resize(original_frame, (IMG_SIZE, IMG_SIZE))
@@ -92,11 +115,6 @@ def process_video(input_video_path, output_video_path):
             prediction = model.predict(input_sequence, verbose=0)
             predicted_class_index = np.argmax(prediction)
             predicted_class_name = CLASSES[predicted_class_index]
-
-            # In a deployed environment, we can't play sound on the server.
-            # The client-side (frontend) should handle the alarm.
-            if predicted_class_name == "Abnormal_Activities":
-                print("Abnormal activity detected. This can be used to trigger an event like a notification or a front-end alarm.")
 
             for frame in original_frame_buffer:
                 display_frame = frame.copy()
@@ -126,28 +144,64 @@ def process_video(input_video_path, output_video_path):
 
     cap.release()
     out.release()
-    return output_video_path
+    
+    # Clean up the original file after processing
+    os.remove(input_video_path)
+    
+    task_status[task_id] = {'status': 'completed', 'progress': 100, 'filename': os.path.basename(output_video_path)}
 
-# Route for handling video uploads (POST request)
+
+# Multiprocessing pool for background tasks
+# The 'initializer' is important to load the model just once per process
+num_cpus = multiprocessing.cpu_count()
+pool = multiprocessing.Pool(processes=num_cpus, initializer=init_worker)
+
+# ------------------ Flask App ------------------
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    """Serves the video upload form."""
+    return render_template("index.html")
+
 @app.route("/upload", methods=["POST"])
 def upload_video():
-    """Handles the video upload and initiates processing."""
+    """Handles video upload, saves file, and dispatches processing to a separate process."""
     if "file" not in request.files:
-        return "No file uploaded", 400
+        return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files["file"]
-    os.makedirs("uploads", exist_ok=True)
-    os.makedirs("outputs", exist_ok=True)
-
-    input_path = os.path.join("uploads", file.filename)
-    output_path = os.path.join("outputs", "predicted_" + file.filename)
+    file_id = str(uuid.uuid4())
+    filename = file.filename
+    input_path = os.path.join(UPLOAD_FOLDER, file_id + '_' + filename)
+    output_path = os.path.join(OUTPUT_FOLDER, file_id + '_' + 'processed_' + filename)
+    
     file.save(input_path)
+    
+    task_status[file_id] = {'status': 'queued'}
+    
+    # Dispatch the video processing to the background pool
+    pool.apply_async(process_video_task, args=(file_id, input_path, output_path))
+    
+    return jsonify({
+        "status": "success",
+        "message": "Video uploaded and is now processing in the background.",
+        "task_id": file_id
+    }), 202
 
-    try:
-        processed_file = process_video(input_path, output_path)
-        return send_file(processed_file, as_attachment=True)
-    except Exception as e:
-        return str(e), 500
+@app.route("/status/<task_id>")
+def get_status(task_id):
+    """Returns the status of a background video processing task."""
+    status_info = task_status.get(task_id, {'status': 'unknown', 'message': 'Task ID not found.'})
+    return jsonify(status_info)
+
+@app.route("/download/<filename>")
+def download_file(filename):
+    """Allows downloading of the processed video file."""
+    filepath = os.path.join(OUTPUT_FOLDER, filename)
+    if os.path.exists(filepath):
+        return send_file(filepath, as_attachment=True)
+    return jsonify({"error": "File not found"}), 404
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
