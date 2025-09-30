@@ -8,45 +8,40 @@ from tensorflow.keras.applications import MobileNetV2
 import multiprocessing
 import uuid
 
-# ------------------ CONSTANTS & PATHS ------------------
+# ------------------ Constants ------------------
 IMG_SIZE = 128
 FRAME_COUNT = 15
 CLASSES = ['Normal_Activities', 'Abnormal_Activities']
 
+# Paths
 UPLOAD_FOLDER = os.path.join(os.getcwd(), 'uploads')
 OUTPUT_FOLDER = os.path.join(os.getcwd(), 'outputs')
 MODEL_PATH = os.path.join(os.getcwd(), 'models', 'cctv_monitoring.keras')
 
-# Create necessary directories
+# Create directories if they don't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# ------------------ GLOBAL MULTIPROCESSING VARIABLES ------------------
-# These must be initialized with their final objects outside of __main__ for Gunicorn workers.
-manager = multiprocessing.Manager() # FIX: Initialize Manager globally
-task_status = manager.dict()       # FIX: Initialize dict globally
+# ------------------ Global variables for multiprocessing ------------------
+model = None
+manager = multiprocessing.Manager()
+task_status = manager.dict()
 num_cpus = multiprocessing.cpu_count()
-# NOTE: The Pool itself cannot be initialized here without triggering the pickling error,
-# so we will initialize the Manager and Dictionary here, and the Pool inside a function.
-pool = None 
-model = None # Model is loaded per worker via init_worker, so it stays None globally
+pool = multiprocessing.Pool(processes=num_cpus, initializer=lambda: init_worker(MODEL_PATH))
 
-# ------------------ MODEL & WORKER FUNCTIONS ------------------
-
+# ------------------ Build Model Architecture ------------------
 def build_model():
-    """Defines the MobileNetV2 + LSTM model architecture."""
+    """Builds and returns the model architecture."""
     input_sequence = Input(shape=(FRAME_COUNT, IMG_SIZE, IMG_SIZE, 3))
     base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(IMG_SIZE, IMG_SIZE, 3))
     for layer in base_model.layers:
         layer.trainable = False
-    
     x = TimeDistributed(base_model)(input_sequence)
     x = TimeDistributed(GlobalAveragePooling2D())(x)
     x = TimeDistributed(Dropout(0.5))(x)
     x = TimeDistributed(BatchNormalization())(x)
     x = LSTM(128, return_sequences=True)(x)
     x = LSTM(64, return_sequences=False)(x)
-    
     x = Dense(256, activation='relu')(x)
     x = BatchNormalization()(x)
     x = Dropout(0.3)(x)
@@ -56,54 +51,30 @@ def build_model():
     x = Dense(64, activation='relu')(x)
     x = Dropout(0.3)(x)
     output = Dense(2, activation='softmax')(x)
-    
-    return Model(inputs=input_sequence, outputs=output)
+    model = Model(inputs=input_sequence, outputs=output)
+    return model
 
 def init_worker(model_path):
-    """
-    Worker initializer function. Loads the model weights into each worker process 
-    only once.
-    """
+    """Load model in worker process once to avoid reloading for every task."""
     global model
     model = build_model()
     try:
         model.load_weights(model_path)
     except FileNotFoundError:
-        print(f"Warning: Model weights file '{model_path}' not found. Predictions disabled.")
+        print(f"Warning: Model weights file '{model_path}' not found. Worker will not make predictions.")
         model = None
     except Exception as e:
         print(f"Error loading model weights: {e}")
         model = None
 
-# FIX: Named function required for Windows multiprocessing (cannot pickle lambda)
-def pool_initializer():
-    """Wrapper to call init_worker with the necessary arguments."""
-    init_worker(MODEL_PATH)
-
-# --- NEW: Function to initialize the pool lazily ---
-def initialize_pool_if_needed():
-    global pool
-    if pool is None:
-        # We need to use 'global pool' here for the variable assignment to work correctly
-        # in the Gunicorn worker process scope.
-        pool = multiprocessing.Pool(processes=num_cpus, initializer=pool_initializer)
-
-
 def process_video_task(task_id, input_video_path, output_video_path):
-    """
-    Performs the intensive video processing and updates the shared task_status.
-    Runs in a separate worker process.
-    """
-    # The global model object is already initialized by init_worker()
-    
+    """Processes the video and overlays the predictions. Runs in a separate process."""
     task_status[task_id] = {'status': 'processing', 'progress': 0}
 
     if model is None:
         task_status[task_id] = {'status': 'error', 'message': 'Model not loaded.'}
         return
-        
-    # --- REMAINDER OF process_video_task remains the same ---
-    # (Simplified for brevity, assuming existing logic is correct)
+
     cap = cv2.VideoCapture(input_video_path)
     if not cap.isOpened():
         task_status[task_id] = {'status': 'error', 'message': 'Could not open input video.'}
@@ -119,7 +90,7 @@ def process_video_task(task_id, input_video_path, output_video_path):
 
     original_frame_buffer = []
     processed_frame_buffer = []
-    predicted_class_name = "Normal_Activities" 
+    predicted_class_name = "Normal_Activities" # Default prediction
 
     frame_count = 0
     while True:
@@ -129,12 +100,12 @@ def process_video_task(task_id, input_video_path, output_video_path):
 
         frame_count += 1
 
-        if total_frames > 0 and frame_count % 100 == 0:
+        if frame_count % 100 == 0:
              task_status[task_id]['progress'] = int((frame_count / total_frames) * 100)
 
         original_frame_buffer.append(original_frame)
         processed_frame = cv2.resize(original_frame, (IMG_SIZE, IMG_SIZE))
-        processed_frame = processed_frame[:, :, ::-1] / 255.0 
+        processed_frame = processed_frame[:, :, ::-1] / 255.0
         processed_frame_buffer.append(processed_frame)
 
         if len(processed_frame_buffer) == FRAME_COUNT:
@@ -174,9 +145,12 @@ def process_video_task(task_id, input_video_path, output_video_path):
     os.remove(input_video_path)
 
     result = {'status': 'completed', 'progress': 100, 'filename': os.path.basename(output_video_path)}
-    result['prediction'] = predicted_class_name
+    if 'predicted_class_name' in locals():
+        result['prediction'] = predicted_class_name
+
     task_status[task_id] = result
-# ------------------ FLASK APPLICATION ROUTES ------------------
+
+# ------------------ Flask App ------------------
 app = Flask(__name__)
 
 @app.route("/")
@@ -186,23 +160,17 @@ def home():
 
 @app.route("/upload", methods=["POST"])
 def upload_video():
-    """Handles video upload and queues the processing task."""
+    """Handles video upload, saves file, and dispatches processing to a separate process."""
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
 
-    # FIX: Initialize pool only when a request comes in, guaranteeing pool is present
-    initialize_pool_if_needed() 
-    
     file = request.files["file"]
     file_id = str(uuid.uuid4())
     filename = file.filename
     input_path = os.path.join(UPLOAD_FOLDER, file_id + '_' + filename)
     output_path = os.path.join(OUTPUT_FOLDER, file_id + '_' + 'processed_' + filename)
 
-    try:
-        file.save(input_path)
-    except Exception as e:
-        return jsonify({"error": f"Failed to save file: {e}"}), 500
+    file.save(input_path)
 
     task_status[file_id] = {'status': 'queued'}
 
@@ -216,7 +184,7 @@ def upload_video():
 
 @app.route("/status/<task_id>")
 def get_status(task_id):
-    """Returns the status of a background video processing task for the frontend."""
+    """Returns the status of a background video processing task."""
     status_info = task_status.get(task_id, {'status': 'unknown', 'message': 'Task ID not found.'})
     return jsonify(status_info)
 
@@ -224,11 +192,9 @@ def get_status(task_id):
 def download_file(filename):
     """Allows downloading of the processed video file."""
     filepath = os.path.join(OUTPUT_FOLDER, filename)
-    
-    if os.path.exists(filepath) and filepath.startswith(OUTPUT_FOLDER):
+    if os.path.exists(filepath):
         return send_file(filepath, as_attachment=True)
     return jsonify({"error": "File not found"}), 404
 
 if __name__ == "__main__":
-    # The Pool is lazily initialized, but we start the server here.
     app.run(host="0.0.0.0", port=5000, debug=True)
