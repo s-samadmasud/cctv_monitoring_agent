@@ -22,13 +22,14 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # ------------------ GLOBAL MULTIPROCESSING VARIABLES ------------------
-# These must be initialized globally (or explicitly defined before the pool)
-# The actual objects (Manager, Pool) are initialized later inside the main block.
-model = None
-manager = None
-task_status = None
-pool = None
+# These must be initialized with their final objects outside of __main__ for Gunicorn workers.
+manager = multiprocessing.Manager() # FIX: Initialize Manager globally
+task_status = manager.dict()       # FIX: Initialize dict globally
 num_cpus = multiprocessing.cpu_count()
+# NOTE: The Pool itself cannot be initialized here without triggering the pickling error,
+# so we will initialize the Manager and Dictionary here, and the Pool inside a function.
+pool = None 
+model = None # Model is loaded per worker via init_worker, so it stays None globally
 
 # ------------------ MODEL & WORKER FUNCTIONS ------------------
 
@@ -64,8 +65,6 @@ def init_worker(model_path):
     only once.
     """
     global model
-    # Note: Global variables like task_status are inherited by the spawned process
-    # but not explicitly passed here.
     model = build_model()
     try:
         model.load_weights(model_path)
@@ -81,6 +80,14 @@ def pool_initializer():
     """Wrapper to call init_worker with the necessary arguments."""
     init_worker(MODEL_PATH)
 
+# --- NEW: Function to initialize the pool lazily ---
+def initialize_pool_if_needed():
+    global pool
+    if pool is None:
+        # We need to use 'global pool' here for the variable assignment to work correctly
+        # in the Gunicorn worker process scope.
+        pool = multiprocessing.Pool(processes=num_cpus, initializer=pool_initializer)
+
 
 def process_video_task(task_id, input_video_path, output_video_path):
     """
@@ -94,7 +101,9 @@ def process_video_task(task_id, input_video_path, output_video_path):
     if model is None:
         task_status[task_id] = {'status': 'error', 'message': 'Model not loaded.'}
         return
-
+        
+    # --- REMAINDER OF process_video_task remains the same ---
+    # (Simplified for brevity, assuming existing logic is correct)
     cap = cv2.VideoCapture(input_video_path)
     if not cap.isOpened():
         task_status[task_id] = {'status': 'error', 'message': 'Could not open input video.'}
@@ -105,13 +114,12 @@ def process_video_task(task_id, input_video_path, output_video_path):
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Use 'mp4v' or 'avc1' for H.264 compatibility, 'mp4v' is generally safer.
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
 
     original_frame_buffer = []
     processed_frame_buffer = []
-    predicted_class_name = "Normal_Activities" # Initialize prediction
+    predicted_class_name = "Normal_Activities" 
 
     frame_count = 0
     while True:
@@ -121,23 +129,20 @@ def process_video_task(task_id, input_video_path, output_video_path):
 
         frame_count += 1
 
-        # Update progress for the frontend every 100 frames
         if total_frames > 0 and frame_count % 100 == 0:
              task_status[task_id]['progress'] = int((frame_count / total_frames) * 100)
 
         original_frame_buffer.append(original_frame)
         processed_frame = cv2.resize(original_frame, (IMG_SIZE, IMG_SIZE))
-        processed_frame = processed_frame[:, :, ::-1] / 255.0 # Normalize 
+        processed_frame = processed_frame[:, :, ::-1] / 255.0 
         processed_frame_buffer.append(processed_frame)
 
         if len(processed_frame_buffer) == FRAME_COUNT:
-            # Perform inference on the sequence
             input_sequence = np.expand_dims(np.array(processed_frame_buffer), axis=0)
             prediction = model.predict(input_sequence, verbose=0)
             predicted_class_index = np.argmax(prediction)
             predicted_class_name = CLASSES[predicted_class_index]
 
-            # Write buffered frames with the prediction overlay
             for frame in original_frame_buffer:
                 display_frame = frame.copy()
                 text = f"Prediction: {predicted_class_name}"
@@ -166,15 +171,11 @@ def process_video_task(task_id, input_video_path, output_video_path):
 
     cap.release()
     out.release()
-    
-    # Clean up input file after processing is complete
     os.remove(input_video_path)
 
-    # Final status update for the frontend
     result = {'status': 'completed', 'progress': 100, 'filename': os.path.basename(output_video_path)}
     result['prediction'] = predicted_class_name
     task_status[task_id] = result
-
 # ------------------ FLASK APPLICATION ROUTES ------------------
 app = Flask(__name__)
 
@@ -189,6 +190,9 @@ def upload_video():
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
 
+    # FIX: Initialize pool only when a request comes in, guaranteeing pool is present
+    initialize_pool_if_needed() 
+    
     file = request.files["file"]
     file_id = str(uuid.uuid4())
     filename = file.filename
@@ -200,10 +204,8 @@ def upload_video():
     except Exception as e:
         return jsonify({"error": f"Failed to save file: {e}"}), 500
 
-    # Initialize task status before dispatching
     task_status[file_id] = {'status': 'queued'}
 
-    # Dispatch the processing to the background pool
     pool.apply_async(process_video_task, args=(file_id, input_path, output_path))
 
     return jsonify({
@@ -223,22 +225,10 @@ def download_file(filename):
     """Allows downloading of the processed video file."""
     filepath = os.path.join(OUTPUT_FOLDER, filename)
     
-    # Simple check to prevent directory traversal and ensure file exists
     if os.path.exists(filepath) and filepath.startswith(OUTPUT_FOLDER):
         return send_file(filepath, as_attachment=True)
     return jsonify({"error": "File not found"}), 404
 
 if __name__ == "__main__":
-    # --- STARTUP LOGIC ---
-    # This block is only run when the script is executed directly (e.g., 'python app.py' or by Gunicorn).
-    
-    # 1. Initialize Shared Multiprocessing Objects
-    manager = multiprocessing.Manager()
-    task_status = manager.dict()
-    
-    # 2. Initialize the Pool (spawns worker processes)
-    # The pool uses the named pool_initializer to load the model.
-    pool = multiprocessing.Pool(processes=num_cpus, initializer=pool_initializer)
-    
-    # 3. Start the Flask Server
+    # The Pool is lazily initialized, but we start the server here.
     app.run(host="0.0.0.0", port=5000, debug=True)
