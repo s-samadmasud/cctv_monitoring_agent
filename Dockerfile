@@ -5,32 +5,22 @@ WORKDIR /app
 
 # Install system dependencies required by OpenCV and gunicorn
 RUN apt-get update && apt-get install -y \
-    libgl1 \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    libfontconfig1 \
-    libice6 \
-    libx11-6 \
-    libxau6 \
-    libxdmcp6 \
-    libxcb1 \
-    libxrender1 \
-    libjpeg-dev \
-    libpng-dev \
-    libtiff-dev \
-    libwebp-dev \
-    ffmpeg \
-    g++ \
-    build-essential \
+    libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 libfontconfig1 \
+    libice6 libx11-6 libxau6 libxdmcp6 libxcb1 libxrender1 \
+    libjpeg-dev libpng-dev libtiff-dev libwebp-dev \
+    ffmpeg g++ build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements file and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code
+# --- NEW: Explicitly create and set permissions for upload/output directories ---
+RUN mkdir -p uploads outputs
+RUN chmod -R 777 uploads outputs
+# -------------------------------------------------------------------------------
+
+# Copy the rest of the application code (app.py, models/ directory, etc.)
 COPY . .
 
 # Expose the port the app will run on
