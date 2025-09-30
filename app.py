@@ -24,10 +24,10 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # ------------------ Global variables for multiprocessing ------------------
 model = None
-manager = multiprocessing.Manager()
-task_status = manager.dict()
+manager = None
+task_status = None
 num_cpus = multiprocessing.cpu_count()
-pool = multiprocessing.Pool(processes=num_cpus, initializer=lambda: init_worker(MODEL_PATH))
+pool = None
 
 # ------------------ Build Model Architecture ------------------
 def build_model():
@@ -197,4 +197,9 @@ def download_file(filename):
     return jsonify({"error": "File not found"}), 404
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    
+        manager = multiprocessing.Manager()
+        task_status = manager.dict()
+        num_cpus = multiprocessing.cpu_count()
+        pool = multiprocessing.Pool(processes=num_cpus, initializer=lambda: init_worker(MODEL_PATH))
+        app.run(host="0.0.0.0", port=5000, debug=True)
